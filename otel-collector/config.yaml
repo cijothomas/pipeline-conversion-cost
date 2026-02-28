@@ -1,0 +1,52 @@
+# OTel Collector config with pprof profiling extension enabled
+# Use this to measure real CPU/memory cost of a passthrough pipeline
+
+extensions:
+  # Exposes Go pprof endpoints for CPU, heap, goroutine profiling
+  pprof:
+    endpoint: 0.0.0.0:1777   # default pprof port
+
+  # Optional: health check endpoint
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Batch processor — keeps this realistic (most deployments use it)
+  # To measure pure conversion cost, you can remove this
+  batch:
+    send_batch_size: 1000
+    timeout: 1s
+
+exporters:
+  # Debug exporter: logs data to stdout (useful for confirming data flows)
+  # Replace with your real exporter (otlp, otlphttp, etc.) as needed
+  debug:
+    verbosity: basic
+
+  # Example: forward to another collector or backend via OTLP
+  # otlphttp:
+  #   endpoint: http://backend:4318
+
+service:
+  extensions: [pprof, health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
