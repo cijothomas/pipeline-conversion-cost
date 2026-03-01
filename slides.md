@@ -132,6 +132,37 @@ Every log record that flows through a Go Collector — even through a zero-proce
 
 At 1 billion log records/day, that is 1 billion unnecessary decode+encode cycles.
 
+**Speaker notes — real-world deployment patterns where passthrough dominates:**
+
+**Pattern 1: Agent (sidecar/daemonset) → Gateway**
+```
+App → sidecar/daemonset collector → gateway/centralized collector → backend
+```
+The agent role is almost entirely passthrough:
+- Receives OTLP from the app on localhost
+- Minimal processing: maybe adds k8s metadata, tail-sampling buffering
+- Exports OTLP to the gateway
+- Runs on **every node** — so its CPU waste multiplies by node count
+
+The gateway does more real work (routing, aggregation, redaction before data leaves the cluster) but still re-decodes everything the agent already decoded and encoded.
+
+**Pattern 2: Cluster gateway → Regional/Cloud collector**
+```
+Gateway (per cluster) → Regional collector (per region) → backend
+```
+Used to aggregate traffic before it crosses expensive inter-region links. The regional collector is near-100% passthrough — receives, maybe rate-limits or batches, and forwards. Full decode+encode at every hop for no benefit.
+
+**Pattern 3: The "just add a collector" anti-pattern**
+Many teams add a collector because "best practice says so" or for future flexibility, configuring it with zero processors. It sits in the path doing literally nothing useful but paying full decode+encode cost on every request.
+
+**Why the agent pattern is the most damaging:**
+- Agents are universally deployed — one per node, always on
+- Their workload is high-frequency, small-batch (one app's traffic)
+- They do the least real processing of any collector role
+- Their wasted CPU is directly on the customer's node bill
+
+A 1000-node cluster with each node agent burning 25% of one CPU core on passthrough decode/encode = **~250 CPU cores of pure waste**. That is a real number worth putting a dollar figure on.
+
 ### Slide 8 — The Format Zoo
 - OTel SDK internal model (language-specific types)
 - OTLP Protobuf (wire format)
