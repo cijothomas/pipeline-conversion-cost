@@ -29,19 +29,44 @@ Download from https://github.com/open-telemetry/opentelemetry-collector-releases
 
 ---
 
-## Capture Profiles
+## Flamegraphs (Recommended)
 
-The `pprof` extension exposes standard Go pprof endpoints at `http://localhost:1777/debug/pprof/`.
+### Quickest way — live flamegraph while load is running
 
-### CPU Profile (30-second capture while sending load)
+Point `go tool pprof` directly at the collector's pprof endpoint. It profiles for 30 seconds and immediately opens a browser with a full interactive flamegraph:
 
 ```bash
-# Capture a 30-second CPU profile
+go tool pprof -http=:8080 "http://localhost:1777/debug/pprof/profile?seconds=30"
+```
+
+- Make sure load is actively flowing into the collector before running this
+- Browser opens automatically at `http://localhost:8080`
+- Navigate to **View → Flame Graph** in the top menu
+
+> Requires Go installed locally (`brew install go` if not). The collector itself runs in Docker; Go is only needed for the analysis tool.
+
+### Save profile first, analyze later
+
+Useful if you want to share the profile or compare before/after:
+
+```bash
+# 1. Capture while load is running
 curl -o cpu.prof "http://localhost:1777/debug/pprof/profile?seconds=30"
 
-# Analyze interactively
+# 2. Open flamegraph in browser
 go tool pprof -http=:8080 cpu.prof
 ```
+
+### What the flamegraph shows
+
+- **X-axis width** = proportion of CPU time (wider = more expensive)
+- **Y-axis** = call stack depth (bottom = entry points, top = leaf functions)
+- Click any frame to zoom in
+- Look for wide blocks in the middle of the stack with names like:
+  - `proto.Marshal` / `proto.Unmarshal` — protobuf conversion cost
+  - `pdata.*` — collector internal model operations
+  - `grpc.*` / `http.*` — transport overhead
+  - Your processor name — legitimate value-add work
 
 ### Heap / Memory Profile
 
