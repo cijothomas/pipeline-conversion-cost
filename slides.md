@@ -57,7 +57,7 @@ App (OTel SDK)
 **Step 1: TCP/HTTP2 bytes arrive**
 Raw bytes land off the network. gRPC reads HTTP2 frames and assembles the complete gRPC message payload.
 
-**Step 2: gRPC codec calls `proto.Unmarshal`** ← *main cost*
+**Step 2: gRPC codec calls `proto.Unmarshal`** ← *where the cost is*
 ```
 grpc/encoding/proto.(*codecV2).Unmarshal
   → proto.Unmarshal(bytes, &ExportLogsServiceRequest{})
@@ -67,53 +67,34 @@ This triggers a recursive decode cascade. For every log record in the batch, Go 
 ExportLogsServiceRequest.Unmarshal     allocates ExportLogsServiceRequest
   └── ResourceLogs.Unmarshal           allocates []ResourceLogs, Resource, attributes
         └── ScopeLogs.Unmarshal        allocates []ScopeLogs, InstrumentationScope
-              └── LogRecord.Unmarshal  allocates []LogRecord, Timestamp, TraceID, SpanID,
+              └── LogRecord.Unmarshal  allocates []LogRecord, Timestamp, TraceID, SpanID
                     └── AnyValue.Unmarshal   allocates body + every attribute KeyValue, AnyValue
 ```
-Every single field with a string or bytes value calls `runtime.slicebytetostring` (copies bytes into a new Go string). Every nested struct is a new heap allocation. `runtime.mallocgc` is called constantly throughout this cascade.
+Every string/bytes field calls `runtime.slicebytetostring` — copying bytes into a new Go string. Every nested struct is a fresh heap allocation. `runtime.mallocgc` runs continuously throughout this cascade, and GC follows.
 
-**Step 3: gRPC routes to the OTLP handler**
-```
-_LogsService_Export_Handler          (gRPC generated dispatch)
-  → plogotlp.rawLogsServer.Export    (collector's plogotlp layer)
-    → otlpreceiver/internal/logs.(*Receiver).Export
-```
-This is pure routing — negligible CPU.
-
-**Step 4: pdata wrapping — `pdata.Logs` is created**
-The protogen structs from step 2 are **not copied** — `pdata.Logs` is a zero-copy wrapper type backed by the same protogen objects. It just assigns a pointer. This step is cheap.
-
-**Step 5: Handed to the consumer pipeline**
-```
-logs.(*Receiver).Export
-  → fanoutconsumer.(*logsConsumer).ConsumeLogs
-    → consumer.ConsumeLogsFunc.ConsumeLogs   ← processors/exporters start here
-```
-Processors and exporters receive `pdata.Logs` and operate through the pdata API. They are reading/writing the same underlying protogen structs from step 2.
+**Processors and exporters receive `pdata.Logs`** — a zero-cost pointer wrapper over the protogen structs from step 2. No copy, no cost.
 
 ---
 
-**What the profile shows — directly from the call tree:**
+**Profile — 15s CPU capture, passthrough pipeline (OTLP gRPC in → debug exporter), logs only:**
 
 ```
-Call chain (cumulative time)                                              Cum
+Call chain                                                               Cum
 ─────────────────────────────────────────────────────────────────────────────
 grpc.(*Server).handleStream                                              1.86s
   grpc/encoding/proto.(*codecV2).Unmarshal                              1.20s  ← gRPC decode
-    _LogsService_Export_Handler                                         1.04s
-      ExportLogsServiceRequest.Unmarshal                                1.04s  ← batch decode
-        ResourceLogs.Unmarshal                                          1.03s  ← per-resource
-          ScopeLogs.Unmarshal                                           0.98s  ← per-scope
-            LogRecord.Unmarshal                                         0.69s  ← per-record
-              AnyValue.Unmarshal                                        0.30s  ← per attribute value
-                runtime.mallocgc                                        0.14s  ← alloc per value
+    ExportLogsServiceRequest.Unmarshal                                  1.04s  ← batch decode
+      ResourceLogs.Unmarshal                                            1.03s  ← per-resource
+        ScopeLogs.Unmarshal                                             0.98s  ← per-scope
+          LogRecord.Unmarshal                                           0.69s  ← per-record
+            AnyValue.Unmarshal                                          0.30s  ← per-attribute
 
-plogotlp.rawLogsServer.Export                                           0.22s
-  logs.(*Receiver).Export                                               0.10s  ← routing
-    fanoutconsumer.(*logsConsumer).ConsumeLogs                          0.10s  ← to pipeline
+runtime.mallocgc   (proto heap allocations)                             0.99s  21% of total CPU
+runtime.gcBgMarkWorker  (GC driven by above)                            0.53s  11% of total CPU
 ```
 
-**Key insight:** `proto.Unmarshal` and its allocation cascade consume **~1.2s of 4.72s (25%)** of total CPU in a passthrough pipeline. The pdata wrap (step 4) costs nothing measurable — it doesn't appear in the profile at all. The entire cost is in decoding bytes into Go heap objects, one allocation per field.
+**`proto.Unmarshal` + its allocation cascade = ~1.2s out of 4.72s total (25% of CPU) — in a pipeline doing no work at all.**
+This profile only captures the receive side. A real OTLP→OTLP pipeline also runs `proto.Marshal` on export, approximately doubling this cost.
 
 ### Slide 8 — The Format Zoo
 - OTel SDK internal model (language-specific types)
