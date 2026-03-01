@@ -96,6 +96,42 @@ runtime.gcBgMarkWorker  (GC driven by above)                            0.53s  1
 **`proto.Unmarshal` + its allocation cascade = ~1.2s out of 4.72s total (25% of CPU) — in a pipeline doing no work at all.**
 This profile only captures the receive side. A real OTLP→OTLP pipeline also runs `proto.Marshal` on export, approximately doubling this cost.
 
+---
+
+### Slide 7b — The Go Collector Always Decodes — Even When It Has Nothing To Do
+
+The Go Collector's architecture has no concept of a lazy or raw-bytes representation. Decoding is **unconditional** — it happens on every request, regardless of whether any processor will ever look at the data.
+
+**Full round-trip for a passthrough pipeline (OTLP in → OTLP out):**
+
+```
+bytes in
+  → proto.Unmarshal()            ← full recursive decode, allocates every struct
+  → protogen structs             ← ResourceLogs, ScopeLogs, LogRecord, AnyValue ...
+  → pdata.Logs (pointer wrap)    ← free, but only because the structs already exist
+  → processors (none / no-op)    ← data is untouched
+  → pdata.Logs (same pointer)
+  → proto.Marshal()              ← full recursive encode, iterates every struct
+  → bytes out
+```
+
+**The decode and encode are not skipped even if:**
+- No processor is configured
+- No processor reads a single field
+- The data is being forwarded byte-for-byte identical to what arrived
+
+The gRPC layer calls `proto.Unmarshal` as the first thing it does after reading the frame, before any collector code runs. There is no hook to intercept this and say "don't bother decoding, I'm just forwarding this."
+
+**What this means at scale:**
+
+Every log record that flows through a Go Collector — even through a zero-processor passthrough pipeline — pays the full cost of:
+1. Allocating a Go heap object for every `LogRecord`, `ResourceLogs`, `ScopeLogs`, `AnyValue`, `KeyValue`
+2. Copying every string field from wire bytes into a new Go string
+3. Running GC to collect all those short-lived objects
+4. Re-encoding everything from scratch on the way out
+
+At 1 billion log records/day, that is 1 billion unnecessary decode+encode cycles.
+
 ### Slide 8 — The Format Zoo
 - OTel SDK internal model (language-specific types)
 - OTLP Protobuf (wire format)
@@ -244,7 +280,7 @@ Collector B: receive OTLP → pdata → export OTLP
 |---|---|---|
 | Hook | 1–3 | ~2 min |
 | Pipeline Definition | 4–6 | ~5 min |
-| Transform Tax | 7–9 | ~7 min |
+| Transform Tax | 7–9 (incl. 7b) | ~7 min |
 | SDK-Side Costs | 10–14 | ~10 min |
 | Collector-Side Costs | 15–19 | ~10 min |
 | Ingestion Mention | 20 | ~3 min |
