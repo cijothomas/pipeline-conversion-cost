@@ -53,9 +53,55 @@ App (OTel SDK)
 ## Section 2: The Hidden Transform Tax (~7 min)
 
 ### Slide 7 — What Happens at Each Boundary?
-- Marshal → transmit → unmarshal → copy into internal representation
-- Repeat at every stage
-- No new information is created
+
+**The exact conversion chain inside a single collector hop:**
+
+```
+bytes (wire)
+  → [proto.Unmarshal]
+      → protogen structs  (auto-generated Go types from .proto files)
+          ExportLogsServiceRequest
+          └── ResourceLogs
+               └── ScopeLogs
+                    └── LogRecord / AnyValue / KeyValue ...
+
+  → [pdata wrapping]
+      → pdata.Logs  (collector's internal abstraction layer)
+          pdata.ResourceLogs
+          └── pdata.ScopeLogs
+               └── pdata.LogRecord
+
+  → processors & exporters operate on pdata (never raw protobuf)
+
+  → [pdata unwrapping]
+      → protogen structs (again)
+
+  → [proto.Marshal]
+      → bytes (wire, next hop)
+```
+
+**Key point:** processors never touch raw bytes or protogen directly — everything is re-wrapped into the `pdata` model first. This means **four structural translations per collector hop**: Unmarshal → wrap → unwrap → Marshal.
+
+**Every conversion allocates new heap objects.** `proto.Unmarshal` creates a new Go struct for every `LogRecord`, `AnyValue`, `KeyValue`, `StringValue`. Then pdata wraps those again. No new information is produced — it's pure structural translation.
+
+**Measured profile — 15s CPU capture, passthrough pipeline (OTLP in → debug exporter), logs only:**
+
+```
+Function                                               Cum     Cum%
+grpc.(*Server).handleStream                           1.86s   39.4%   gRPC dispatch
+grpc/encoding/proto.(*codecV2).Unmarshal              1.20s   25.4%   gRPC proto decode
+protobuf/proto.Unmarshal                              1.05s   22.2%   pure protobuf deserialization
+ExportLogsServiceRequest.Unmarshal                    1.04s   22.0%   top-level batch decode
+ResourceLogs.Unmarshal                                1.03s   21.8%   resource-level decode
+ScopeLogs.Unmarshal                                   0.98s   20.8%   scope-level decode
+LogRecord.Unmarshal                                   0.69s   14.6%   per-record decode
+runtime.mallocgc                                      0.99s   21.0%   heap allocs from proto objects
+runtime.gcBgMarkWorker                                0.53s   11.2%   GC running continuously
+```
+
+**This profile only captures the receive side** (the `debug` exporter doesn't re-serialize). In a real OTLP→OTLP pipeline, the `proto.Marshal` + pdata unwrap on the export side would approximately **double** this cost.
+
+**What is NOT visible here:** any value-generating work — because there is none. No processors were configured. Every CPU cycle in this profile is pure format conversion overhead.
 
 ### Slide 8 — The Format Zoo
 - OTel SDK internal model (language-specific types)
